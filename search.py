@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 from utils.vector_store import VectorStore
 
@@ -76,12 +76,7 @@ def format_result(doc: Dict[str, Any], score: float) -> str:
 """
 
 
-def search_documents(
-        query: str,
-        schema_path: Optional[str] = None,
-        limit: int = 5,
-        min_score: float = 0.001
-) -> List[Tuple[float, Dict[str, Any]]]:
+def search_documents(query: str, schema_path: Optional[str] = None, limit: int = 5, min_score: float = 0.001):
     """Search documents using the query and return results.
 
     Args:
@@ -110,6 +105,7 @@ def search_documents(
             logger.info(f"Found {len(results)} matching documents")
             for score, doc in results:
                 title = doc.get('title', 'Untitled')
+                # explanation = vector_store._generate_explanation(query, doc, score)
                 logger.debug(f"Match (score={score:.3f}): {title}")
 
         return results
@@ -194,7 +190,7 @@ def main():
             json_results = [
                 {
                     "score": score,
-                    "document": doc
+                    "document": doc["_source"]
                 }
                 for score, doc in results
             ]

@@ -5,6 +5,7 @@ import os
 from textwrap import dedent
 from typing import List, Tuple, Dict, Any, Optional
 
+import numpy as np
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -77,7 +78,14 @@ class VectorStore:
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=vectors_config,
-                on_disk_payload=True
+                on_disk_payload=True,
+                quantization_config=models.ScalarQuantization(
+                    scalar=models.ScalarQuantizationConfig(
+                        type=models.ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=True
+                    )
+                )
             )
 
             # Create payload index for document text search
@@ -147,16 +155,24 @@ class VectorStore:
             logger.debug(f"Generating embedding for text sample: {text[:200]}...")
 
             response = self.openai.embeddings.create(
-                model="text-embedding-ada-002",
+                model="text-embedding-3-small",
                 input=text,
                 encoding_format="float"
             )
             embedding = response.data[0].embedding
 
-            logger.debug(f"Generated embedding with dimension {len(embedding)}")
-            return embedding
+            # Normalize the embedding
+            return self._normalize_embedding(embedding)
         except Exception as e:
             raise RuntimeError(f"Error generating embedding: {str(e)}")
+
+    def _normalize_embedding(self, embedding: List[float]) -> List[float]:
+        """Normalize the embedding vector."""
+        embedding = np.array(embedding)
+        norm = np.linalg.norm(embedding)
+        if norm != 0:
+            embedding = embedding / norm
+        return embedding.tolist()
 
     def _generate_filter_conditions(self, query: str) -> Optional[models.Filter]:
         """Generate Qdrant filter conditions from natural language query using LLM if schema is available."""
@@ -356,7 +372,7 @@ class VectorStore:
             }
 
             # Generate point ID from document ID
-            point_id = int(hashlib.md5(doc_id.encode()).hexdigest()[:8], 16)
+            point_id = abs(hash(doc_id)) % (2 ** 63)  # Use native Python hash with positive 63-bit integers
 
             # Add to Qdrant
             self.qdrant.upsert(
@@ -373,7 +389,7 @@ class VectorStore:
         except Exception as e:
             raise RuntimeError(f"Error adding document to vector store: {str(e)}")
 
-    def search(self, query: str, k: int = 5, score_threshold: float = 0.001) -> List[Tuple[float, Dict[str, Any]]]:
+    def search(self, query: str, k: int = 5, score_threshold: float = 0.3) -> List[Tuple[float, Dict[str, Any]]]:
         """Search for similar documents using semantic search and optional filtering if schema is available.
 
         Args:
@@ -387,9 +403,8 @@ class VectorStore:
         try:
             logger.info(f"Searching with query: {query}")
             query_vector = self._get_embedding(query)
-
-            # Generate filter conditions if schema is available
             filter_conditions = None
+
             if self.schema:
                 filter_conditions = self._generate_filter_conditions(query)
                 if filter_conditions:
@@ -397,32 +412,26 @@ class VectorStore:
                 else:
                     logger.debug("No filter conditions applied, using semantic search only")
 
-            # Search in Qdrant
-            # search_result = self.qdrant.search(
-            #     collection_name=self.collection_name,
-            #     query_vector=query_vector,
-            #     limit=k * 2,  # Request extra results to account for filtering
-            #     score_threshold=score_threshold,
-            #     query_filter=filter_conditions
-            # )
-            search_result = self.qdrant.search(
+            # Search in Qdrant using query_points
+            search_result = self.qdrant.query_points(
                 collection_name=self.collection_name,
-                query_vector=query_vector,
-                limit=k * 3,  # Increase oversampling factor
+                limit=k * 3,
                 with_payload=True,
                 with_vectors=False,
+                query=query_vector,
                 query_filter=filter_conditions,
                 score_threshold=score_threshold,
                 search_params=models.SearchParams(
-                    hnsw_ef=128  # Increase accuracy at slight performance cost
+                    hnsw_ef=128
                 )
             )
+            print(score_threshold)
 
             # Process results
             results = []
             seen_docs = set()  # Track unique documents
 
-            for hit in search_result:
+            for hit in search_result.points:
                 if 'document' in hit.payload:
                     doc = hit.payload['document']
                     doc_key = json.dumps(doc, sort_keys=True)  # Create unique key for document
@@ -442,30 +451,76 @@ class VectorStore:
             raise RuntimeError(f"Error performing search: {str(e)}")
 
     # Add query classification layer
-    def _classify_query_type(self, query: str, use_llm: bool = False, classificator_llm: OpenAI = None) -> str:
-        """Categorize query into types:
-        - Fact lookup
-        - Comparative analysis
-        - Temporal analysis
-        - Freeform exploration
-        """
+    def _classify_query_type(self, query: str, use_llm: bool = True) -> str:
+        """Categorize query into types: Fact lookup, Comparative analysis, Temporal analysis, Freeform exploration."""
         logger.info(f"Classifying the query: {query}")
 
-        # Use small LLM classifier or regex patterns
         if use_llm:
-            # Use LLM to classify query
-            if not classificator_llm:
-                classificator_llm = self.openai
-            pass
-        pass
+            try:
+                prompt = f"""
+                Classify the following search query into one of these categories:
+                - Fact lookup (straightforward information retrieval)
+                - Comparative analysis (comparing entities)
+                - Temporal analysis (queries involving time)
+                - Freeform exploration (open-ended discovery)
+
+                Query: {query}
+
+                Classification:
+                """
+
+                response = self.openai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a query classifier."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=50,
+                    temperature=0.1
+                )
+                classification = response.choices[0].message.content.strip().lower()
+                logger.info(f"Query classified as: {classification}")
+                return classification
+            except Exception as e:
+                logger.error(f"Error classifying query: {e}")
+                return "fact lookup"  # default
+        else:
+            # Simple rule-based (example)
+            if "compare" in query.lower() or "vs" in query.lower():
+                return "comparative analysis"
+            elif "when" in query.lower() or "date" in query.lower() or "time" in query.lower():
+                return "temporal analysis"
+            else:
+                return "fact lookup"
 
     # Add explainability to results
-    def _generate_explanation(self, query: str, doc: dict, score: float, llm: OpenAI) -> str:
+    def _generate_explanation(self, query: str, doc: Dict[str, Any], score: float) -> str:
         """Generate natural language explanation of why document matched"""
-        # Use LLM to compare query and document features
-        if not llm:
-            llm = self.openai
-        pass
+        try:
+            prompt = f"""
+            Explain why this document is relevant to the query, based on its content and a similarity score of {score:.3f}.
+
+            Query: {query}
+
+            Document: {json.dumps(doc, indent=2)}
+
+            Explanation:
+            """
+
+            response = self.openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are an explanation generator."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=200,
+                temperature=0.2
+            )
+            explanation = response.choices[0].message.content.strip()
+            return explanation
+        except Exception as e:
+            logger.error(f"Error generating explanation: {e}")
+            return "No explanation available."
 
     def add_documents_batch(self, documents: List[Tuple[str, str, Dict[str, Any]]], batch_size: int = 100):
         """Add multiple documents to the vector store in batches.

@@ -3,3 +3,4 @@ openai
 qdrant-client
 tenacity
 jsonschema
+fastembed
